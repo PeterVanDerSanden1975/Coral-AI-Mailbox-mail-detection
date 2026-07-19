@@ -30,6 +30,16 @@ MODEL_PATH = _cfg.get('camera', 'model_path')
 LABEL_PATH = _cfg.get('camera', 'label_path')
 RTSP_URL   = _cfg.get('camera', 'rtsp_url')
 
+# RTSP connection/read timeouts -- without these, cv2.VideoCapture.read() can
+# block forever on a stalled stream, which leaves the reader thread stuck and
+# leaks a duplicate RTSP connection to the camera every time the watchdog
+# tries (and fails) to restart it. This eventually exhausts the camera's
+# connection limit, blocking both this app and other RTSP viewers.
+CAM_OPEN_TIMEOUT_MS  = _cfg.getint('camera', 'open_timeout_ms')  if _cfg.has_option('camera', 'open_timeout_ms')  else 5000
+CAM_READ_TIMEOUT_MS  = _cfg.getint('camera', 'read_timeout_ms')  if _cfg.has_option('camera', 'read_timeout_ms')  else 5000
+CAM_WATCHDOG_SECONDS = _cfg.getint('camera', 'watchdog_seconds') if _cfg.has_option('camera', 'watchdog_seconds') else 8
+CAM_RECONNECT_DELAY  = _cfg.getfloat('camera', 'reconnect_delay') if _cfg.has_option('camera', 'reconnect_delay') else 3.0
+
 MQTT_BROKER   = _cfg.get('mqtt', 'broker')
 MQTT_PORT     = _cfg.getint('mqtt', 'port')
 MQTT_USER     = _cfg.get('mqtt', 'user')
@@ -77,6 +87,11 @@ MAILBOX_DWELL_MIN    = _cfg.getfloat('post_detectie', 'mailbox_dwell_min')
 MAILBOX_DWELL_MAX    = _cfg.getfloat('post_detectie', 'mailbox_dwell_max')
 APPROACH_MIN_SECONDS = _cfg.getfloat('post_detectie', 'approach_min_seconds')
 POST_COOLDOWN_SECONDS= _cfg.getfloat('post_detectie', 'post_cooldown')
+# Require actual leftward/rightward movement (not just position) before
+# confirming arrival at / departure from the mailbox. Set to false in
+# config.ini if this turns out too strict for your camera angle.
+REQUIRE_DIRECTION_CHECK = _cfg.getboolean('post_detectie', 'require_direction_check') \
+    if _cfg.has_option('post_detectie', 'require_direction_check') else True
 
 TRACKER_MAX_DISAPPEARED  = _cfg.getint('tracker', 'max_disappeared')
 TRACKER_RESET_SECONDS    = _cfg.getint('tracker', 'reset_seconds')
@@ -241,7 +256,8 @@ class PostTracker:
         # PHASE 3 first: DEPARTING - check whether person leaves to the right
         # =========================================================
         if current_state == POST_STATE_DEPARTING:
-            if not in_mailbox and cx_ai > DEPART_MIN_CX and cy_ai < DEPART_MAX_CY:
+            at_depart_pos = not in_mailbox and cx_ai > DEPART_MIN_CX and cy_ai < DEPART_MAX_CY
+            if at_depart_pos and (not REQUIRE_DIRECTION_CHECK or self._moving_right(obj_id, cx_ai)):
                 self._confirm(obj_id, now)
                 return POST_STATE_CONFIRMED, True
             return POST_STATE_DEPARTING, False
@@ -276,12 +292,18 @@ class PostTracker:
                 self._reset(obj_id)
             elif in_mailbox:
                 approach_time = now - self.approach_entry.get(obj_id, now)
-                if approach_time >= APPROACH_MIN_SECONDS and obj_id in self.arrived_from_right:
+                moving_toward = not REQUIRE_DIRECTION_CHECK or self._moving_left(obj_id, cx_ai)
+                if approach_time >= APPROACH_MIN_SECONDS and obj_id in self.arrived_from_right and moving_toward:
                     self.mailbox_entry[obj_id] = now
                     self.states[obj_id] = POST_STATE_MAILBOX
                     print(f"[POST] ID={obj_id} -> AT_MAILBOX (approach={approach_time:.1f}s)")
                 else:
-                    reason = "approach too short" if approach_time < APPROACH_MIN_SECONDS else "did not arrive from the right"
+                    if approach_time < APPROACH_MIN_SECONDS:
+                        reason = "approach too short"
+                    elif obj_id not in self.arrived_from_right:
+                        reason = "did not arrive from the right"
+                    else:
+                        reason = "not moving toward mailbox"
                     print(f"[POST] ID={obj_id} -> RESET ({reason})")
                     self._reset(obj_id)
 
@@ -341,27 +363,35 @@ class CentroidTracker:
     def post_tracker(self):
         return self._post_tracker
 
+    def _expire_if_stale(self, obj_id):
+        """Bumps the disappeared-counter for an object that wasn't matched this
+        frame; deregisters it once it exceeds max_disappeared. Also confirms a
+        pending delivery if the object vanished top-right while DEPARTING."""
+        if obj_id not in self.disappeared:
+            return
+        self.disappeared[obj_id] += 1
+        if self.disappeared[obj_id] > self.max_disappeared:
+            state = self._post_tracker.get_state(obj_id)
+            if state == POST_STATE_DEPARTING:
+                last_pos = self.objects.get(obj_id, (0, 0))
+                last_cx, last_cy = last_pos[0], last_pos[1]
+                if last_cx > DEPART_MIN_CX and last_cy < DEPART_MAX_CY:
+                    print(f"[POST] ID={obj_id} disappeared top-right during DEPARTING -> DELIVERY CONFIRMED")
+                    self._post_tracker._confirm(obj_id, time.time())
+                    self.pending_post_ids.add(obj_id)
+                else:
+                    print(f"[POST] ID={obj_id} disappeared but position cx={last_cx:.0f} cy={last_cy:.0f} doesn't match, no delivery")
+            self._post_tracker.remove(obj_id)
+            self.deregister(obj_id)
+
     def update(self, rects, labels_list):
         current_time = time.time()
         if (current_time - self.last_seen_time) > self.reset_after_seconds:
             self.__init__(self.max_disappeared, self.reset_after_seconds, self.max_trace_points)
 
         if not rects:
-            for obj_id in list(self.disappeared.keys()):
-                self.disappeared[obj_id] += 1
-                if self.disappeared[obj_id] > self.max_disappeared:
-                    state = self._post_tracker.get_state(obj_id)
-                    if state == POST_STATE_DEPARTING:
-                        last_pos = self.objects.get(obj_id, (0, 0))
-                        last_cx, last_cy = last_pos[0], last_pos[1]
-                        if last_cx > DEPART_MIN_CX and last_cy < DEPART_MAX_CY:
-                            print(f"[POST] ID={obj_id} disappeared top-right during DEPARTING -> DELIVERY CONFIRMED")
-                            self._post_tracker._confirm(obj_id, time.time())
-                            self.pending_post_ids.add(obj_id)
-                        else:
-                            print(f"[POST] ID={obj_id} disappeared but position cx={last_cx:.0f} cy={last_cy:.0f} doesn't match, no delivery")
-                    self._post_tracker.remove(obj_id)
-                    self.deregister(obj_id)
+            for obj_id in list(self.objects.keys()):
+                self._expire_if_stale(obj_id)
             return self.objects
 
         input_centroids = []
@@ -374,33 +404,50 @@ class CentroidTracker:
         else:
             object_ids = list(self.objects.keys())
             registered_this_frame = set()
+            matched_inputs = set()
 
+            # Build all valid (distance, input_idx, obj_id) candidates -- same
+            # label, within the match radius -- then assign globally
+            # nearest-first. This prevents an input processed earlier from
+            # grabbing a "good enough" ID that actually belongs to another,
+            # closer input later in the list (which can swap IDs between two
+            # nearby same-label objects).
+            candidates = []
             for i, i_centroid in enumerate(input_centroids):
                 i_label = labels_list[i]
-                distances, valid_ids = [], []
                 for oid in object_ids:
-                    if oid in registered_this_frame:
-                        continue
                     if self.labels[oid] == i_label:
                         d = math.hypot(i_centroid[0] - self.objects[oid][0],
                                        i_centroid[1] - self.objects[oid][1])
-                        distances.append(d)
-                        valid_ids.append(oid)
+                        if d < 60:
+                            candidates.append((d, i, oid))
+            candidates.sort(key=lambda c: c[0])
 
-                if distances and min(distances) < 60:
-                    idx = distances.index(min(distances))
-                    best_id = valid_ids[idx]
-                    self.objects[best_id] = i_centroid
-                    self.disappeared[best_id] = 0
-                    registered_this_frame.add(best_id)
+            for d, i, oid in candidates:
+                if i in matched_inputs or oid in registered_this_frame:
+                    continue
+                i_centroid = input_centroids[i]
+                self.objects[oid] = i_centroid
+                self.disappeared[oid] = 0
+                registered_this_frame.add(oid)
+                matched_inputs.add(i)
 
-                    if best_id not in self.traces:
-                        self.traces[best_id] = []
-                    self.traces[best_id].append(i_centroid)
-                    if len(self.traces[best_id]) > self.max_trace_points:
-                        self.traces[best_id].pop(0)
-                else:
-                    self.register(i_centroid, i_label)
+                if oid not in self.traces:
+                    self.traces[oid] = []
+                self.traces[oid].append(i_centroid)
+                if len(self.traces[oid]) > self.max_trace_points:
+                    self.traces[oid].pop(0)
+
+            for i, i_centroid in enumerate(input_centroids):
+                if i not in matched_inputs:
+                    self.register(i_centroid, labels_list[i])
+
+            # Objects that existed before this frame but weren't matched are
+            # one frame closer to expiring, regardless of whether other
+            # objects were detected this frame.
+            for oid in object_ids:
+                if oid not in registered_this_frame:
+                    self._expire_if_stale(oid)
 
         self.last_seen_time = current_time
         return self.objects
@@ -435,7 +482,7 @@ STATE_COLORS = {
 # RTSP CAMERA READER - separate thread with watchdog
 # =============================================================================
 class RTSPReader:
-    WATCHDOG_SECONDS = 8  # Reconnect after N seconds with no new frame
+    WATCHDOG_SECONDS = CAM_WATCHDOG_SECONDS  # Reconnect after N seconds with no new frame
 
     def __init__(self, url):
         self.url = url
@@ -452,6 +499,12 @@ class RTSPReader:
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
         c = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
         c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Without these, cap.read() can block forever on a stalled stream
+        # instead of failing fast so the reader loop can reconnect.
+        open_prop = getattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC', 53)
+        read_prop = getattr(cv2, 'CAP_PROP_READ_TIMEOUT_MSEC', 54)
+        c.set(open_prop, CAM_OPEN_TIMEOUT_MS)
+        c.set(read_prop, CAM_READ_TIMEOUT_MS)
         return c
 
     def _reader_loop(self):
@@ -472,7 +525,7 @@ class RTSPReader:
             else:
                 print("[CAM] cap.read() failed -- reconnecting...")
                 cap.release()
-                time.sleep(3)
+                time.sleep(CAM_RECONNECT_DELAY)
                 if not self._stop_reader:
                     cap = self._make_cap()
         cap.release()
@@ -488,9 +541,12 @@ class RTSPReader:
             if age > self.WATCHDOG_SECONDS:
                 print(f"[CAM] Watchdog: no frame for {age:.0f}s -- restarting stream")
                 self._stop_reader = True
-                self._thread.join(timeout=5)  # wait max 5s
+                # Reader may currently be blocked inside cap.read(); give it enough
+                # time to hit the read timeout + reconnect-sleep before giving up.
+                join_timeout = (CAM_READ_TIMEOUT_MS / 1000.0) + CAM_RECONNECT_DELAY + 2
+                self._thread.join(timeout=join_timeout)
                 if self._thread.is_alive():
-                    print("[CAM] Warning: old reader thread still active after 5s timeout")
+                    print(f"[CAM] Warning: old reader thread still active after {join_timeout:.0f}s timeout")
                 # Only now start a new thread (no more duplicate RTSP connection)
                 self._stop_reader = False
                 self._last_frame_time = time.time()  # prevent immediate re-trigger
